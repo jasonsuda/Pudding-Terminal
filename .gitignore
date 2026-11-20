@@ -1,0 +1,31 @@
+# Local runtime state
+/config/
+/device_logs/
+*.ini
+*.log
+*.pcap
+*.pcapng
+*.pem
+*.crt
+*.cer
+*.key
+*.pfx
+*.p12
+.env
+.env.*
+
+# Environments and generated files
+.venv/
+.work/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+artifacts/
+*.exe
+*.dll
+*.pyd
+*.msi
+*.msix
+*.whl
