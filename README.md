@@ -32,3 +32,7 @@ The terminal opens disconnected. Start receive logging manually after signing in
 The application stores preferences in `config/pudding.ini` next to the source and uses `device_logs/` in the same folder by default. Protect those files and omit them from shared archives and issue reports. If you report a layout or connection problem, use synthetic examples and include the Windows version and Python version.
 
 [Third-party notices](THIRD_PARTY_NOTICES.md)
+
+## Run the connection tests
+
+Use the same Windows x64 virtual environment as the app. Run the [test suite](BUILD.md#run-the-connection-tests) to check Serial, SSH, and Telnet with synthetic data and loopback peers. See the [changelog](CHANGELOG.md) for coverage and validation limits.

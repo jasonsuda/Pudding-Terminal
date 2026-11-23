@@ -17,3 +17,15 @@ $entry = Join-Path $project 'Pudding Terminal.py'
 ```
 
 The first launch requires no connection settings. Use a writable source folder. Preferences and default receive logs are stored beside the entry point even when PowerShell is started from a different working directory. Initial configuration, generated logs, wheel archives and virtual environments are local to each installation. This source distribution ships no compiled application artifacts.
+
+## Run the connection tests
+
+With the locked dependencies installed and `$project` and `$python` set as shown in the README, run the suite from any PowerShell working directory.
+
+```powershell
+& $python -X utf8 -B -m unittest discover -s (Join-Path $project 'tests') -v
+```
+
+The suite runs Qt offscreen. It uses pyserial's `loop://`, local SSH and Telnet servers on port `0` so Windows assigns free ports, and a temporary preferences directory per test. SSH host keys are generated in memory and the login uses synthetic credentials. The tests require no physical COM port, external host, or extra package.
+
+Verbose output names each test. A connection timeout reports the waiting step and the application's status and dialogs. The [Windows workflow](.github/workflows/windows-tests.yml) runs the suite after checking the locked dependencies.
