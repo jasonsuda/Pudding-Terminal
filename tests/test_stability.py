@@ -244,3 +244,11 @@ class StabilityTests(unittest.TestCase):
         self.assertFalse(window.diagnostic_status.isHidden())
         self.assertIn("UnitTest.callback", window.diagnostic_status.toolTip())
         self.assertIn("ValueError", window.diagnostic_status.toolTip())
+
+    def test_persistent_path_resolves_app_dir_aliases_and_rejects_outside_paths(self):
+        unresolved = self.state / "sub" / ".."
+        with patch.object(terminal, "APP_DIR", unresolved):
+            resolved = terminal.persistent_path("config/pudding.ini")
+            self.assertEqual(resolved, self.state.resolve() / "config" / "pudding.ini")
+            with self.assertRaises(PermissionError):
+                terminal.persistent_path(self.state.parent / "outside.ini")

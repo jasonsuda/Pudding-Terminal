@@ -45,12 +45,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
 APP_DIR = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
 
 def persistent_path(value):
+    app_dir = APP_DIR.resolve()
     path = Path(value).expanduser()
-    path = (path if path.is_absolute() else APP_DIR / path).resolve()
+    path = (path if path.is_absolute() else app_dir / path).resolve()
     windows = Path(os.environ.get('SystemRoot', r'C:\Windows')).resolve()
     if path == windows or windows in path.parents:
         raise PermissionError('禁止將持久檔案寫入 Windows 系統目錄。請選擇其他位置。')
-    if not path.is_relative_to(APP_DIR):
+    if not path.is_relative_to(app_dir):
         raise PermissionError('請選擇程式資料夾內的持久檔案位置。')
     return path
 
