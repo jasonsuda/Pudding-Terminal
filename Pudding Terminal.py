@@ -11,13 +11,19 @@ import codecs
 import concurrent.futures
 import copy
 import ctypes
+import faulthandler
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
 import time
+import traceback
+from collections import OrderedDict, deque
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 import asyncssh
 import pyte
@@ -26,12 +32,14 @@ import serial.tools.list_ports
 import telnetlib3
 from telnetlib3.telopt import NAWS
 from wcwidth import wcswidth
-from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QThread, QTimer, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import Qt, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QThread, QTimer, pyqtSignal, qInstallMessageHandler
 from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton,
  QVBoxLayout, QHBoxLayout, QFormLayout, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox,
  QCheckBox, QStackedWidget, QScrollArea, QAbstractScrollArea, QDialog, QDialogButtonBox,
- QFontComboBox, QColorDialog, QFileDialog, QInputDialog, QMessageBox, QMenu, QSizePolicy, QStyle)
+ QFontComboBox, QColorDialog, QFileDialog, QInputDialog, QMessageBox, QMenu, QSizePolicy,
+ QProxyStyle, QStyle)
 
 # ---------------- Portable paths and preferences ----------------
 APP_DIR = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
@@ -42,6 +50,8 @@ def persistent_path(value):
     windows = Path(os.environ.get('SystemRoot', r'C:\Windows')).resolve()
     if path == windows or windows in path.parents:
         raise PermissionError('禁止將持久檔案寫入 Windows 系統目錄。請選擇其他位置。')
+    if not path.is_relative_to(APP_DIR):
+        raise PermissionError('請選擇程式資料夾內的持久檔案位置。')
     return path
 
 def system_theme():
@@ -57,6 +67,7 @@ def system_theme():
 DEFAULTS = {
  'connection/type': 'SSH', 'serial/port': 'COM1', 'serial/baud': 9600,
  'serial/data': '8', 'serial/parity': 'None', 'serial/stop': '1', 'serial/flow': 'None',
+ 'serial/reconnect': False,
  'ssh/host': '', 'ssh/port': 22, 'telnet/host': '', 'telnet/port': 23,
  'terminal/font': 'Consolas', 'terminal/size': 11, 'terminal/foreground': '#90ee90',
  'terminal/background': '#0e0e0e', 'terminal/encoding': 'utf-8', 'terminal/history': 5000,
@@ -394,6 +405,26 @@ ANSI_COLORS = dict(zip(
  ['black','red','green','brown','blue','magenta','cyan','white','brightblack','brightred','brightgreen','brightbrown','brightblue','brightmagenta','brightcyan','brightwhite'],
  ['#000000','#cd3131','#0dbc79','#e5e510','#2472c8','#bc3fbc','#11a8cd','#e5e5e5','#666666','#f14c4c','#23d18b','#f5f543','#3b8eea','#d670d6','#29b8db','#ffffff']))
 
+def qt_alive(obj):
+    return obj is not None and not sip.isdeleted(obj)
+
+def guard_ui(callback):
+    @wraps(callback)
+    def invoke(self, *args, **kwargs):
+        if not qt_alive(self):
+            return
+        try:
+            return callback(self, *args, **kwargs)
+        except Exception:
+            record_exception(callback.__qualname__)
+    return invoke
+
+def single_shot_timer(owner, callback):
+    timer = QTimer(owner)
+    timer.setSingleShot(True)
+    timer.timeout.connect(callback)
+    return timer
+
 class TerminalWidget(QAbstractScrollArea):
     transmit = pyqtSignal(bytes)
     sizeChanged = pyqtSignal(int, int)
@@ -421,18 +452,15 @@ class TerminalWidget(QAbstractScrollArea):
         self._following = True
         self._scroll_anchor = None
         self._primary_view_state = None
+        self._grid_needs_sync = False
         self.verticalScrollBar().valueChanged.connect(self._scroll_changed)
         self.set_appearance()
         self.blink_on = True
         self.blink_timer = QTimer(self)
         self.blink_timer.timeout.connect(self._blink)
         self.blink_timer.start(550)
-        self.resize_timer = QTimer(self)
-        self.resize_timer.setSingleShot(True)
-        self.resize_timer.timeout.connect(self._resize_grid)
-        self.paint_timer = QTimer(self)
-        self.paint_timer.setSingleShot(True)
-        self.paint_timer.timeout.connect(self.viewport().update)
+        self.resize_timer = single_shot_timer(self, self._resize_grid)
+        self.paint_timer = single_shot_timer(self, self._update_viewport)
 
     def set_appearance(self):
         self.cell_font = QFont(self.options['terminal/font'], int(self.options['terminal/size']))
@@ -457,8 +485,8 @@ class TerminalWidget(QAbstractScrollArea):
         self._following = True
         self._scroll_anchor = None
         self._primary_view_state = None
-        self.verticalScrollBar().setRange(0, 0)
-        self.viewport().update()
+        self._sync_scrollbar((True, None))
+        self._update_viewport()
 
     def feed(self, data):
         was_alt = self.model.in_alternate
@@ -477,33 +505,63 @@ class TerminalWidget(QAbstractScrollArea):
         if not self.paint_timer.isActive():
             self.paint_timer.start(16)
 
+    @guard_ui
+    def _update_viewport(self):
+        viewport = self.viewport()
+        if qt_alive(viewport):
+            viewport.update()
+
+    @guard_ui
     def _blink(self):
         self.blink_on = not self.blink_on
-        self.viewport().update()
+        viewport = self.viewport()
+        if qt_alive(viewport):
+            viewport.update()
 
+    @guard_ui
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if hasattr(self, 'resize_timer'):
+        if qt_alive(getattr(self, 'resize_timer', None)):
             self.resize_timer.start(60)
 
+    @guard_ui
     def _resize_grid(self):
-        cols = max(2, int((self.viewport().width()-self.grid_left()-6)/self.cell_width))
-        rows = max(2, int((self.viewport().height()-8)/self.cell_height))
-        if (cols, rows) != (self.model.screen.columns, self.model.screen.lines):
+        viewport = self.viewport()
+        if not qt_alive(viewport) or not qt_alive(self.verticalScrollBar()):
+            return
+        cols = max(2, int((viewport.width()-self.grid_left()-6)/self.cell_width))
+        rows = max(2, int((viewport.height()-8)/self.cell_height))
+        sizes = [(screen.columns, screen.lines) for screen in (self.model.primary, self.model.alternate)]
+        if not self._grid_needs_sync and all(size == (cols, rows) for size in sizes):
+            return
+        self._grid_needs_sync = True
+        try:
             state = self._view_state()
             self.clear_selection()
             self.model.resize(cols, rows)
             self._sync_scrollbar(state)
             self.sizeChanged.emit(cols, rows)
-            self.viewport().update()
+        except Exception:
+            record_exception('TerminalWidget._resize_grid', requested=[cols, rows], previous=sizes,
+                             alternate=self.model.in_alternate)
+            return
+        self._grid_needs_sync = False
+        self._update_viewport()
 
-    def _scroll_changed(self):
-        self._following = self.verticalScrollBar().value() == self.verticalScrollBar().maximum()
-        self._scroll_anchor = None
-        if not self._following and not self.model.in_alternate:
-            self._scroll_anchor = self._primary_rows()[self.verticalScrollBar().value()]
+    @guard_ui
+    def _scroll_changed(self, _value=None):
+        bar = self.verticalScrollBar()
+        if not qt_alive(bar):
+            return
+        count = 0 if self.model.in_alternate else len(self.model.primary.history.top)
+        value = min(count, max(0, bar.value()))
+        following = value == count
+        anchor = None if following else self.model.primary.history.top[value]
+        if bar.minimum() != 0 or bar.maximum() != count:
+            self._sync_scrollbar((following, anchor))
+        else:
+            self._following, self._scroll_anchor = following, anchor
         self.clear_selection()
-        self.viewport().update()
 
     def _primary_rows(self):
         screen = self.model.primary
@@ -516,7 +574,7 @@ class TerminalWidget(QAbstractScrollArea):
             return False,self._scroll_anchor
         rows = self._primary_rows()
         value = self.verticalScrollBar().value()
-        return False, rows[value] if value < len(rows) else None
+        return False, rows[value] if 0 <= value < len(rows) else None
 
     def _sync_scrollbar(self, state):
         following, anchor = state
@@ -530,11 +588,14 @@ class TerminalWidget(QAbstractScrollArea):
             if position < 0:  # The anchor was explicitly cleared or capacity-evicted.
                 position = 0
                 anchor = rows[0] if rows else None
-        bar.blockSignals(True)
-        bar.setRange(0,count)
-        bar.setPageStep(self.model.screen.lines)
-        bar.setValue(min(position,count))
-        bar.blockSignals(False)
+        was_blocked = bar.blockSignals(True)
+        try:
+            bar.setRange(0,count)
+            bar.setPageStep(self.model.screen.lines)
+            bar.setValue(min(position,count))
+        finally:
+            if qt_alive(bar):
+                bar.blockSignals(was_blocked)
         # A clamped maximum is not a user request to follow new output.
         self._following = following
         self._scroll_anchor = None if following else anchor
@@ -571,8 +632,14 @@ class TerminalWidget(QAbstractScrollArea):
         self._resize_grid()
         self.viewport().update()
 
+    @guard_ui
     def paintEvent(self, event):
-        painter = QPainter(self.viewport())
+        viewport = self.viewport()
+        if qt_alive(viewport):
+            with QPainter(viewport) as painter:
+                self._paint_terminal(painter)
+
+    def _paint_terminal(self, painter):
         bg, fg = self.options['terminal/background'], self.options['terminal/foreground']
         painter.fillRect(self.viewport().rect(), QColor(bg))
         screen = self.model.screen
@@ -683,7 +750,7 @@ class TerminalWidget(QAbstractScrollArea):
 
     def clear_selection(self):
         self.anchor = self.selection_end = self.frozen_rows = None
-        self.viewport().update()
+        self._update_viewport()
 
     def selected_text(self):
         if self.anchor is None or self.anchor == self.selection_end:
@@ -834,38 +901,268 @@ class TerminalWidget(QAbstractScrollArea):
         self.clear_selection()
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
-# ---------------- Explicit receive-only session logs ----------------
+# ---------------- Diagnostics and receive-only session logs ----------------
+DIAGNOSTICS = None
+
+def process_resources():
+    result = {'python_threads': threading.active_count()}
+    if sys.platform != 'win32':
+        return result
+    from ctypes import wintypes
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('faults', wintypes.DWORD),
+                    ('peak', ctypes.c_size_t), ('working_set', ctypes.c_size_t),
+                    ('other', ctypes.c_size_t * 6)]
+    kernel = ctypes.windll.kernel32
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    process = wintypes.HANDLE(kernel.GetCurrentProcess())
+    memory = MemoryCounters()
+    memory.size = ctypes.sizeof(memory)
+    if kernel.K32GetProcessMemoryInfo(process, ctypes.byref(memory), memory.size):
+        result['working_set_bytes'] = memory.working_set
+    handles = wintypes.DWORD()
+    if kernel.GetProcessHandleCount(process, ctypes.byref(handles)):
+        result['handles'] = handles.value
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [(n, wintypes.DWORD) for n in ('size', 'usage', 'id', 'owner', 'base', 'delta', 'flags')]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel.CreateToolhelp32Snapshot(4, 0)
+    if snapshot not in (None, ctypes.c_void_p(-1).value):
+        try:
+            entry = ThreadEntry()
+            entry.size = ctypes.sizeof(entry)
+            count = 0
+            ok = kernel.Thread32First(wintypes.HANDLE(snapshot), ctypes.byref(entry))
+            while ok:
+                count += int(entry.owner == os.getpid())
+                ok = kernel.Thread32Next(wintypes.HANDLE(snapshot), ctypes.byref(entry))
+            result['native_threads'] = count
+        finally:
+            kernel.CloseHandle(wintypes.HANDLE(snapshot))
+    return result
+
+def diagnostic(event, **fields):
+    if DIAGNOSTICS is not None:
+        DIAGNOSTICS.event(event, **fields)
+
+def record_exception(callback, **state):
+    if DIAGNOSTICS is not None:
+        DIAGNOSTICS.record_exception(*sys.exc_info(), callback=callback, **state)
+    else:
+        sys.excepthook(*sys.exc_info())
+
+class Diagnostics:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.events = self.faults = None
+        self.recent_failures = deque(maxlen=32)
+        self.reported_callbacks = OrderedDict()
+        self.error = None
+        self.previous_qt = None
+        self.qt_installed = False
+        sys.excepthook = self.exception
+        threading.excepthook = self.thread_exception
+
+    def open_files(self):
+        try:
+            directory = persistent_path('diagnostics')
+            directory.mkdir(parents=True, exist_ok=True)
+            run = datetime.now().strftime('%Y%m%d_%H%M%S_%f') + f'_{os.getpid()}'
+            self.events = (directory / f'Runtime_{run}.jsonl').open('x', encoding='utf-8')
+            fault_file = (directory / f'Crash_{run}.txt').open('x', encoding='utf-8')
+            try:
+                faulthandler.enable(fault_file, all_threads=True)
+            except Exception:
+                fault_file.close()
+                raise
+            self.faults = fault_file
+        except Exception as exc:
+            self.error = f'無法初始化診斷檔案（{type(exc).__name__}）'
+            self.record_exception(*sys.exc_info(), callback='Diagnostics.open_files')
+        try:
+            self.previous_qt = qInstallMessageHandler(self.qt_message)
+            self.qt_installed = True
+            self.event('startup', python=sys.version.split()[0], frozen=bool(getattr(sys, 'frozen', False)),
+                       **process_resources())
+        except Exception as exc:
+            self.error = f'無法啟用完整診斷（{type(exc).__name__}）'
+            self.record_exception(*sys.exc_info(), callback='Diagnostics.open_files')
+
+    def event(self, name, **fields):
+        with self.lock:
+            if self.events is not None:
+                try:
+                    record = {'time': datetime.now().astimezone().isoformat(timespec='milliseconds'),
+                              'event': name, 'pid': os.getpid(), **fields}
+                    self.events.write(json.dumps(record, ensure_ascii=True) + '\n')
+                    self.events.flush()
+                    return
+                except Exception as exc:
+                    self.error = f'診斷紀錄寫入失敗（{type(exc).__name__}）'
+                    stream, self.events = self.events, None
+                    self._close_stream(stream)
+            if name == 'uncaught_exception':
+                self.recent_failures.append(fields)
+
+    def exception(self, kind, value, frames):
+        self.record_exception(kind, value, frames)
+
+    def record_exception(self, kind, value, frames, callback=None, **state):
+        try:
+            # Read code locations only. Exception messages and locals can contain credentials.
+            locations = deque(maxlen=24)
+            for frame, line in traceback.walk_tb(frames):
+                code = frame.f_code
+                locations.append([Path(code.co_filename).name, line, code.co_qualname])
+            inferred = locations[0] if locations else ('', 0, 'Python')
+            callback = callback or inferred[2]
+            key = (callback, kind.__name__, tuple(locations[-1]) if locations else ())
+            now = time.monotonic()
+            with self.lock:
+                last, suppressed = self.reported_callbacks.pop(key, (float('-inf'), 0))
+                if now-last < 5:
+                    self.reported_callbacks[key] = (last, suppressed+1)
+                    return
+                self.reported_callbacks[key] = (now, 0)
+                if len(self.reported_callbacks) > 64:
+                    self.reported_callbacks.popitem(last=False)
+                self.event('uncaught_exception', callback=callback, type=kind.__name__,
+                           frames=list(locations), state=state, repeated=suppressed)
+        except BaseException:
+            # This is the exception hook's last boundary, including a failing diagnostics sink.
+            self.error = '診斷例外記錄失效（Python 例外攔截仍啟用）'
+
+    def thread_exception(self, args):
+        self.exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    def qt_message(self, kind, context, message):
+        self.event('qt_message', level=kind.name, category=context.category,
+                   source=Path(context.file).name if context.file else None, line=context.line,
+                   message=message[:1000])
+
+    def _close_stream(self, stream):
+        try:
+            stream.close()
+        except Exception as exc:
+            if self.error is None:
+                self.error = f'診斷檔案關閉失敗（{type(exc).__name__}）'
+
+    def close(self):
+        if self.qt_installed:
+            qInstallMessageHandler(self.previous_qt)
+        if self.faults is not None:
+            faulthandler.disable()
+            self._close_stream(self.faults)
+        with self.lock:
+            if self.events is not None:
+                self._close_stream(self.events)
+                self.events = None
+        # Keep the Python hooks active during Qt/Python teardown.
+
+
 class SessionLogger:
     def __init__(self):
         self.handle = None
         self.state = 'text'
         self.at_line_start = True
         self.interval = 0
+        self.rotate_retry = 0
+        self.lock = threading.RLock()
+        self.decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        self.fault = None
+        self.rotation_warning = None
+        self.last_received = None
+        self.bytes_received = 0
+        self.bytes_without_log = 0
+
+    def reset_input(self, encoding):
+        with self.lock:
+            self.decoder = codecs.getincrementaldecoder(encoding)(errors='replace')
+
+    def receive(self, data):
+        with self.lock:
+            now = datetime.now().astimezone()
+            self.last_received = now.isoformat(timespec='milliseconds')
+            self.bytes_received += len(data)
+            if self.fault:
+                self.bytes_without_log += len(data)
+            self.write(self.decoder.decode(data), now)
+
+    def end_input(self):
+        with self.lock:
+            self.write(self.decoder.decode(b'', final=True))
+            self.decoder.reset()
+            self.state = 'text'
 
     def start(self, directory, interval=0, timestamp=False):
-        self.stop()
-        self.directory = persistent_path(directory)
-        self.directory.mkdir(parents=True,exist_ok=True)
-        self.interval,self.timestamp = interval,timestamp
-        self.state,self.at_line_start = 'text',True
-        self._open()
+        with self.lock:
+            directory = persistent_path(directory)
+            directory.mkdir(parents=True,exist_ok=True)
+            self._open(directory, 'session_open' if self.handle is None else 'session_directory_changed')
+            self.directory = directory
+            self.interval,self.timestamp = interval,timestamp
+            self.state,self.at_line_start = 'text',True
+            self.fault = None
 
-    def _open(self):
+    def configure(self, interval=None, timestamp=None):
+        with self.lock:
+            if interval is not None:
+                self.interval = interval
+            if timestamp is not None:
+                self.timestamp = timestamp
+
+    def _open(self, directory, reason):
         name = 'Session_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.txt'
-        self.handle = (self.directory/name).open('x',encoding='utf-8',newline='')
+        new_file = (directory/name).open('x',encoding='utf-8',newline='')
+        old_file, self.handle = self.handle, new_file
         self.started = time.monotonic()
+        self.rotate_retry = 0
+        self.rotation_warning = None
+        diagnostic(reason, file=name)
+        self._close(old_file)
+
+    def _close(self, handle):
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except OSError as exc:
+            self.rotation_warning = '關閉舊日誌失敗，請檢查磁碟'
+            diagnostic('session_close_failed', type=type(exc).__name__, errno=exc.errno)
 
     def stop(self):
-        if self.handle:
-            self.handle.close()
-            self.handle = None
+        with self.lock:
+            if self.handle:
+                handle, self.handle = self.handle, None
+                self._close(handle)
+                diagnostic('session_closed')
 
-    def write(self, text):
-        if self.handle is None:
-            return
-        if self.interval and time.monotonic()-self.started>=self.interval:
-            self.stop()
-            self._open()
+    def rotate_if_due(self):
+        with self.lock:
+            now = time.monotonic()
+            if not self.handle or not self.interval or now < max(self.started+self.interval, self.rotate_retry):
+                return
+            try:
+                self._open(self.directory, 'session_rotated')
+            except OSError as exc:
+                self.rotate_retry = now + 15
+                self.rotation_warning = '換檔失敗，仍寫入上一份日誌'
+                diagnostic('session_rotate_failed', type=type(exc).__name__, errno=exc.errno)
+
+    def write(self, text, received_at=None):
+        with self.lock:
+            if self.handle is None:
+                return
+            self.rotate_if_due()
+            try:
+                self._write_text(text, received_at or datetime.now())
+            except OSError as exc:
+                self.fault = '日誌寫入失敗，紀錄已停止'
+                diagnostic('session_write_failed', type=type(exc).__name__, errno=exc.errno,
+                           affected_characters=len(text))
+                self.stop()
+
+    def _write_text(self, text, received_at):
         output = []
         for c in text:
             if self.state == 'text':
@@ -876,7 +1173,7 @@ class SessionLogger:
                     continue
                 if self.at_line_start and c not in '\r\n':
                     if self.timestamp:
-                        output.append(datetime.now().strftime('[%H:%M:%S] '))
+                        output.append(received_at.strftime('[%H:%M:%S] '))
                     self.at_line_start = False
                 output.append(c)
                 if c == '\n':
@@ -897,57 +1194,153 @@ class SessionLogger:
         self.handle.write(''.join(output))
         self.handle.flush()
 
+def maintain_session(logger, stop):
+    heartbeat_at = started = time.monotonic()
+    while not stop.wait(1):
+        logger.rotate_if_due()
+        now = time.monotonic()
+        if DIAGNOSTICS is not None and now >= heartbeat_at:
+            diagnostic('heartbeat', uptime_seconds=round(now-started, 1),
+                       last_rx=logger.last_received, rx_bytes=logger.bytes_received,
+                       bytes_after_log_failure=logger.bytes_without_log, **process_resources())
+            heartbeat_at = now + 60
+
 # ---------------- Connection worker; UI communication only through signals ----------------
 class ConnectionWorker(QThread):
     received = pyqtSignal(bytes)
     connected = pyqtSignal()
     problem = pyqtSignal(str)
     prompt = pyqtSignal(object)
+    serial_reconnecting = pyqtSignal()
 
-    def __init__(self, config, size, parent=None):
+    def __init__(self, config, size, parent=None, logger=None):
         super().__init__(parent)
         self.config,self.size = dict(config),size
+        self.protocol = self.config['type']
+        self.control_lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.loop = self.task = None
-        self.stop_requested = False
+        self.resize_queued = False
+        self.network_ready = False
         self.pending_prompt = None
-        self.connection = self.writer = self.process = self.output = None
+        self.connection = self.writer = self.process = None
+        self.output = queue.Queue(maxsize=1024) if self.protocol == 'Serial' else None
+        self.logger = logger
+        self.serial_online = False
+        self.serial_lock = threading.Lock()
+        self.display = bytearray()
+        self.display_lock = threading.Lock()
+        self.display_skipped = 0
+        self.display_total_skipped = 0
+
+    @property
+    def stop_requested(self):
+        return self.stop_event.is_set()
+
+    def _receive(self, data):
+        if self.logger is not None:
+            self.logger.receive(data)
+            with self.display_lock:
+                if len(self.display) + len(data) > 1024 * 1024:
+                    self.display_skipped += len(self.display)
+                    self.display_total_skipped += len(self.display)
+                    self.display.clear()
+                self.display.extend(data)
+        self.received.emit(data)
+
+    def take_display(self, limit=16384):
+        with self.display_lock:
+            data = bytes(self.display[:limit])
+            del self.display[:limit]
+            skipped, self.display_skipped = self.display_skipped, 0
+            return data, skipped
 
     def run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.task = self.loop.create_task(self._session())
         try:
-            self.loop.run_until_complete(self.task)
+            if self.protocol == 'Serial':
+                try:
+                    self._serial_session()
+                finally:
+                    self._close_transport()
+            else:
+                self._run_network()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
+            if not isinstance(exc, (serial.SerialException, PermissionError, asyncssh.HostKeyNotVerifiable)):
+                record_exception('ConnectionWorker.run', protocol=self.protocol, stopping=self.stop_requested)
             if not self.stop_requested:
-                if isinstance(exc,(serial.SerialException, PermissionError)) and self.config.get('type') == 'Serial':
+                diagnostic('connection_error', protocol=self.protocol, type=type(exc).__name__)
+                if isinstance(exc, (serial.SerialException, PermissionError)) and self.protocol == 'Serial':
                     self.problem.emit('Serial 連線失敗：請確認 COM 埠、存取權限、接線及參數。若 COM 埠已被占用，請手動關閉占用該埠的程式後再重試。')
                 elif isinstance(exc,asyncssh.HostKeyNotVerifiable):
                     self.problem.emit('SSH 主機金鑰未獲信任或已變更，已拒絕連線。請核對主機身分。')
                 else:
                     self.problem.emit(f'連線失敗或中斷（{type(exc).__name__}）。請檢查位址、連接埠、驗證及網路。')
         finally:
-            self._close_transport()
-            pending = asyncio.all_tasks(self.loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                self.loop.run_until_complete(asyncio.gather(*pending,return_exceptions=True))
-            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
-            self.loop.close()
-            self.loop = None
-            self.config.clear()
+            try:
+                if self.logger is not None:
+                    try:
+                        self.logger.end_input()
+                    finally:
+                        self.logger.stop()
+            except Exception:
+                record_exception('ConnectionWorker.run.log_cleanup', protocol=self.protocol)
+            finally:
+                diagnostic('connection_ended', protocol=self.protocol, requested=self.stop_requested,
+                           display_skipped=self.display_total_skipped)
+                self.config.clear()
+
+    def _run_network(self):
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            self.output = asyncio.Queue(maxsize=1024)
+            task = loop.create_task(self._session())
+            with self.control_lock:
+                self.loop, self.task = loop, task
+                if self.stop_requested:
+                    task.cancel()
+            loop.run_until_complete(task)
+        finally:
+            # Publish and withdraw the loop under the same lock used for scheduling.
+            with self.control_lock:
+                self.loop = self.task = None
+                self.resize_queued = False
+            try:
+                self._close_transport()
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+
+    def _request_prompt(self, **request):
+        with self.control_lock:
+            if self.stop_requested:
+                return None
+            future = concurrent.futures.Future()
+            self.pending_prompt = future
+        self.prompt.emit({**request, 'future':future})
+        return future
+
+    def _clear_prompt(self, future):
+        with self.control_lock:
+            if self.pending_prompt is future:
+                self.pending_prompt = None
 
     async def ask(self, kind, message, echo=False):
-        future = concurrent.futures.Future()
-        self.pending_prompt = future
-        self.prompt.emit({'kind':kind,'message':message,'echo':echo,'future':future})
+        future = self._request_prompt(kind=kind, message=message, echo=echo)
+        if future is None:
+            return None
         try:
             return await asyncio.wrap_future(future)
         finally:
-            self.pending_prompt = None
+            self._clear_prompt(future)
 
     def trust_host(self, host, port, key):
         endpoint = f'{host}:{port}'
@@ -955,41 +1348,21 @@ class ConnectionWorker(QThread):
         trusted = self.config.get('host_keys',{}).get(endpoint)
         if trusted is not None:
             return trusted == public
-        future = concurrent.futures.Future()
-        self.pending_prompt = future
-        self.prompt.emit({'kind':'hostkey','message':f'主機：{endpoint}\n類型：{key.get_algorithm()}\n指紋：{key.get_fingerprint()}\n\n請與管理者核對後決定是否信任並保存。',
-                         'endpoint':endpoint,'public':public,'future':future})
+        future = self._request_prompt(kind='hostkey', endpoint=endpoint, public=public,
+            message=f'主機：{endpoint}\n類型：{key.get_algorithm()}\n指紋：{key.get_fingerprint()}\n\n請與管理者核對後決定是否信任並保存。')
+        if future is None:
+            return False
         try:
             return bool(future.result(timeout=120))
         except (concurrent.futures.TimeoutError,concurrent.futures.CancelledError):
             return False
         finally:
-            self.pending_prompt = None
+            self._clear_prompt(future)
 
     async def _session(self):
         if self.stop_requested:
             return
-        self.output = asyncio.Queue(maxsize=1024)
-        kind = self.config['type']
-        if kind == 'Serial':
-            cfg,flow = self.config,self.config['serial/flow']
-            self.connection = serial.Serial(cfg['serial/port'],int(cfg['serial/baud']),
-             bytesize=int(cfg['serial/data']),parity={'None':'N','Even':'E','Odd':'O','Mark':'M','Space':'S'}[cfg['serial/parity']],
-             stopbits=float(cfg['serial/stop']),xonxoff=flow=='XON/XOFF',rtscts=flow=='RTS/CTS',dsrdtr=flow=='DSR/DTR',timeout=0,write_timeout=.5)
-            self.connected.emit()
-            while not self.stop_requested:
-                for _ in range(64):
-                    try:
-                        data = self.output.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if self.connection.write(data)!=len(data):
-                        raise serial.SerialTimeoutException('Incomplete serial write')
-                data = self.connection.read(min(65536,self.connection.in_waiting))
-                if data:
-                    self.received.emit(data)
-                await asyncio.sleep(.01)
-            return
+        kind = self.protocol
         if kind == 'SSH':
             owner = self
             class InteractiveClient(asyncssh.SSHClient):
@@ -1012,15 +1385,22 @@ class ConnectionWorker(QThread):
                 return
             self.connection = await asyncssh.connect(self.config['host'],port=self.config['port'],username=username,
              client_factory=InteractiveClient,known_hosts=(),client_keys=[],agent_path=None,login_timeout=120,connect_timeout=12)
-            self.process = await self.connection.create_process(term_type='xterm-256color',term_size=self.size,encoding=None,stderr=asyncssh.STDOUT)
+            size = self._current_size()
+            self.process = await self.connection.create_process(term_type='xterm-256color',term_size=size,encoding=None,stderr=asyncssh.STDOUT)
             reader,self.writer = self.process.stdout,self.process.stdin
         else:
             owner = self
             class SizedTelnetClient(telnetlib3.TelnetClient):
                 def send_naws(self):
-                    return owner.size[1],owner.size[0]
+                    columns, lines = owner._current_size()
+                    return lines, columns
+            size = self._current_size()
             reader,self.writer = await telnetlib3.open_connection(self.config['host'],self.config['port'],
-             client_factory=SizedTelnetClient,encoding=False,term='xterm-256color',cols=self.size[0],rows=self.size[1],connect_timeout=12,connect_maxwait=1.0)
+             client_factory=SizedTelnetClient,encoding=False,term='xterm-256color',cols=size[0],rows=size[1],connect_timeout=12,connect_maxwait=1.0)
+        self.network_ready = True
+        if self._current_size() != size:
+            self._apply_network_size()
+        diagnostic('connection_open', protocol=kind)
         self.connected.emit()
         sender = asyncio.create_task(self._send_network())
         read_task = None
@@ -1035,8 +1415,9 @@ class ConnectionWorker(QThread):
                 data = read_task.result()
                 if not data:
                     break
-                self.received.emit(data)
+                self._receive(data)
         finally:
+            self.network_ready = False
             sender.cancel()
             if read_task:
                 read_task.cancel()
@@ -1045,6 +1426,63 @@ class ConnectionWorker(QThread):
             if kind=='SSH' and self.connection:
                 await self.connection.wait_closed()
 
+    def _serial_session(self):
+        cfg, flow = self.config, self.config['serial/flow']
+        gap_started = None
+        while not self.stop_requested:
+            try:
+                self.connection = serial.Serial(cfg['serial/port'], int(cfg['serial/baud']),
+                    bytesize=int(cfg['serial/data']),
+                    parity={'None':'N','Even':'E','Odd':'O','Mark':'M','Space':'S'}[cfg['serial/parity']],
+                    stopbits=float(cfg['serial/stop']), xonxoff=flow=='XON/XOFF',
+                    rtscts=flow=='RTS/CTS', dsrdtr=flow=='DSR/DTR', timeout=0, write_timeout=.5)
+            except OSError as exc:
+                if gap_started is None:
+                    raise
+                diagnostic('serial_reopen_failed', type=type(exc).__name__)
+                self.stop_event.wait(3)
+                continue
+            diagnostic('connection_open' if gap_started is None else 'serial_reconnected', protocol='Serial',
+                       gap_seconds=None if gap_started is None else round(time.monotonic()-gap_started, 3))
+            gap_started = None
+            with self.serial_lock:
+                self.serial_online = True
+            self.connected.emit()
+            try:
+                while not self.stop_requested:
+                    for _ in range(64):
+                        if self.stop_requested:
+                            return
+                        try:
+                            data = self.output.get_nowait()
+                        except queue.Empty:
+                            break
+                        if self.connection.write(data) != len(data):
+                            raise serial.SerialTimeoutException('Incomplete serial write')
+                    data = self.connection.read(min(65536, self.connection.in_waiting))
+                    if data:
+                        self._receive(data)
+                    self.stop_event.wait(.01)
+            except OSError as exc:
+                reconnect_enabled = bool(cfg.get('serial/reconnect', DEFAULTS['serial/reconnect']))
+                diagnostic('serial_disconnected', type=type(exc).__name__, reconnect=reconnect_enabled)
+                if not reconnect_enabled or self.stop_requested:
+                    raise
+                with self.serial_lock:
+                    self.serial_online = False
+                    while not self.output.empty():
+                        self.output.get_nowait()
+                self._close_transport()
+                self.connection = None
+                if self.logger is not None:
+                    self.logger.end_input()
+                gap_started = time.monotonic()
+                self.serial_reconnecting.emit()
+                self.stop_event.wait(3)
+            finally:
+                with self.serial_lock:
+                    self.serial_online = False
+
     async def _send_network(self):
         while True:
             data = await self.output.get()
@@ -1052,48 +1490,70 @@ class ConnectionWorker(QThread):
             await self.writer.drain()
 
     def send(self, data):
-        if self.loop and self.output is not None and not self.stop_requested:
-            def enqueue():
-                try:
-                    self.output.put_nowait(data)
-                except asyncio.QueueFull:
-                    self.problem.emit('傳送佇列已滿，已停止連線；請減少貼上資料量後重連。')
-                    self.task.cancel()
+        if self.protocol == 'Serial':
             try:
-                self.loop.call_soon_threadsafe(enqueue)
-            except RuntimeError:
-                pass
+                with self.serial_lock:
+                    if self.serial_online and not self.stop_requested:
+                        self.output.put_nowait(data)
+            except queue.Full:
+                self.problem.emit('傳送佇列已滿，已停止連線；請減少貼上資料量後重連。')
+                self.stop()
+            return
+        with self.control_lock:
+            if self.loop is not None and not self.stop_requested:
+                self.loop.call_soon_threadsafe(self._enqueue_network, data)
+
+    def _enqueue_network(self, data):
+        if not self.network_ready or self.stop_requested:
+            return
+        try:
+            self.output.put_nowait(data)
+        except asyncio.QueueFull:
+            self.problem.emit('傳送佇列已滿，已停止連線；請減少貼上資料量後重連。')
+            self.stop()
 
     def resize_terminal(self, columns, lines):
-        self.size = columns,lines
-        def apply():
-            try:
-                if self.process:
-                    self.process.change_terminal_size(columns,lines)
-                elif self.writer and self.config.get('type')=='Telnet' and self.writer.local_option.enabled(NAWS):
-                    # telnetlib3 5.0.1 has no public resize notifier. The callback is
-                    # public; pinned _send_naws emits IAC-escaped negotiated NAWS.
-                    self.writer._send_naws()
-            except (OSError,RuntimeError):
+        with self.control_lock:
+            if self.stop_requested:
+                return
+            self.size = columns, lines
+            if self.loop is not None and not self.resize_queued:
+                self.loop.call_soon_threadsafe(self._apply_network_size)
+                self.resize_queued = True
+
+    def _current_size(self):
+        with self.control_lock:
+            return self.size
+
+    def _apply_network_size(self):
+        with self.control_lock:
+            self.resize_queued = False
+            columns, lines = self.size
+        if not self.network_ready or self.stop_requested:
+            return
+        try:
+            if self.process:
+                self.process.change_terminal_size(columns,lines)
+            elif self.protocol == 'Telnet' and self.writer and self.writer.local_option.enabled(NAWS):
+                # Pinned telnetlib3 5.0.1 emits IAC-escaped negotiated NAWS here.
+                self.writer._send_naws()
+        except Exception:
+            record_exception('ConnectionWorker._apply_network_size', protocol=self.protocol,
+                             columns=columns, lines=lines)
+            if not self.stop_requested:
                 self.problem.emit('終端尺寸同步失敗，請重新連線。')
-        if self.loop:
-            try:
-                self.loop.call_soon_threadsafe(apply)
-            except RuntimeError:
-                pass
 
     def stop(self):
-        self.stop_requested = True
-        if self.pending_prompt and not self.pending_prompt.done():
-            try:
-                self.pending_prompt.set_result(None)
-            except concurrent.futures.InvalidStateError:
-                pass
-        if self.loop and self.task:
-            try:
+        with self.control_lock:
+            if self.stop_requested:
+                return
+            self.stop_event.set()
+            future = self.pending_prompt
+            if self.loop is not None:
                 self.loop.call_soon_threadsafe(self.task.cancel)
-            except RuntimeError:
-                pass
+        # Future cancellation can invoke callbacks. Run them outside the lock.
+        if future is not None:
+            future.cancel()
 
     def _close_transport(self):
         for item in (self.writer,self.connection):
@@ -1101,7 +1561,7 @@ class ConnectionWorker(QThread):
                 try:
                     item.close()
                 except (OSError,RuntimeError):
-                    pass
+                    record_exception('ConnectionWorker._close_transport', protocol=self.protocol)
 
 # ---------------- UI 2.0 palette and vector actions ----------------
 MODERN_COLORS = {
@@ -1212,12 +1672,39 @@ class TitleBar(QFrame):
         return super().eventFilter(watched,event)
 
     def mousePressEvent(self, event):
-        if event.button()==Qt.MouseButton.LeftButton:
-            self.window.windowHandle().startSystemMove()
+        handle = self.window.windowHandle()
+        if event.button()==Qt.MouseButton.LeftButton and handle:
+            handle.startSystemMove()
+            event.accept()
 
     def mouseDoubleClickEvent(self, event):
         if event.button()==Qt.MouseButton.LeftButton:
             self.window.toggle_maximize_window()
+            event.accept()
+
+
+class ContrastStyle(QProxyStyle):
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element != QStyle.PrimitiveElement.PE_IndicatorCheckBox:
+            return super().drawPrimitive(element, option, painter, widget)
+        enabled = bool(option.state & QStyle.StateFlag.State_Enabled)
+        checked = bool(option.state & QStyle.StateFlag.State_On)
+        accent = option.palette.color(QPalette.ColorRole.Highlight)
+        rect = QRectF(option.rect).adjusted(1,1,-1,-1)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(accent if checked else option.palette.color(QPalette.ColorRole.Text), 1.3))
+        painter.setOpacity(1 if enabled else .5)
+        painter.setBrush(accent if checked else option.palette.color(QPalette.ColorRole.Base))
+        painter.drawRoundedRect(rect, 2.5, 2.5)
+        if checked:
+            painter.setPen(QPen(QColor('white'), 1.6))
+            center = rect.center()
+            painter.drawLine(center + QPointF(-4,0), center + QPointF(-1,3))
+            painter.drawLine(center + QPointF(-1,3), center + QPointF(4,-3))
+        painter.restore()
+
+
 class ModernWindow(QMainWindow):
     """保留原生 Windows frame style，僅移除標題列的 client inset。"""
     def __init__(self):
@@ -1226,6 +1713,8 @@ class ModernWindow(QMainWindow):
         self._native_attempted = False
         self._snap_pressed = False
         self._maximize_toggle_pending = False
+        self._maximize_target = None
+        self._maximize_timer = single_shot_timer(self, self._apply_window_state)
         if sys.platform == "win32":
             # Keep Qt's Windows platform plugin in native-frame mode. A frameless
             # Qt flag plus manual WS_CAPTION made showMaximized change geometry
@@ -1237,17 +1726,22 @@ class ModernWindow(QMainWindow):
 
     def toggle_maximize_window(self, maximized=None):
         # Native caption double-click and Qt buttons must use the same Qt state.
-        if self._maximize_toggle_pending:
+        if self._maximize_toggle_pending or getattr(self, 'closing', False):
             return
+        self._maximize_target = maximized
         self._maximize_toggle_pending = True
-        def apply():
-            try:
-                target = not self.isMaximized() if maximized is None else maximized
-                self.showMaximized() if target else self.showNormal()
-                self._update_window_chrome()
-            finally:
-                self._maximize_toggle_pending = False
-        QTimer.singleShot(0, apply)
+        self._maximize_timer.start(0)
+
+    @guard_ui
+    def _apply_window_state(self):
+        try:
+            if getattr(self, 'closing', False):
+                return
+            target = not self.isMaximized() if self._maximize_target is None else self._maximize_target
+            self.showMaximized() if target else self.showNormal()
+            self._update_window_chrome()
+        finally:
+            self._maximize_toggle_pending = False
 
     def showMaximized(self):
         if not self.isMaximized() and not self.isMinimized():
@@ -1319,6 +1813,13 @@ class ModernWindow(QMainWindow):
                 self._corner_result = -1
 
     def nativeEvent(self, event_type, message):
+        try:
+            return self._native_event(message)
+        except Exception:
+            record_exception('ModernWindow.nativeEvent')
+            return False, 0
+
+    def _native_event(self, message):
         if not self._native_ready:
             return False, 0
         from ctypes import wintypes
@@ -1444,18 +1945,35 @@ class ModernWindow(QMainWindow):
 # ---------------- Compact settings dialog; no credential fields ----------------
 class SettingsCategoryCombo(QComboBox):
     """Keep the category list below its control, independent of QSS menu mode."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_timer = single_shot_timer(self, self._place_popup)
+
+    @guard_ui
     def showPopup(self):
         super().showPopup()
         self._place_popup()
         # The internal container completes its layout on the next Qt event turn.
-        QTimer.singleShot(0,self._place_popup)
+        self._popup_timer.start(0)
 
+    @guard_ui
+    def hidePopup(self):
+        if qt_alive(getattr(self, '_popup_timer', None)):
+            self._popup_timer.stop()
+        super().hidePopup()
+
+    @guard_ui
     def _place_popup(self):
-        popup = self.view().window()
-        if not popup.isVisible():
+        view = self.view()
+        if not qt_alive(view):
+            return
+        popup = view.window()
+        if not qt_alive(popup) or not popup.isVisible():
             return
         origin = self.mapToGlobal(QPoint())
         screen = QApplication.screenAt(origin) or self.screen()
+        if not qt_alive(screen):
+            return
         area = screen.availableGeometry()
         below = origin.y()+self.height()
         below_space = max(0,area.bottom()+1-below)
@@ -1548,9 +2066,14 @@ class SettingsDialog(QDialog):
             ('serial/stop','Stop Bits',['1','1.5','2']),
             ('serial/flow','Flow Control',['None','RTS/CTS','XON/XOFF','DSR/DTR'])):
             combo(f,key,label,items).setEnabled(not connected)
-        hint = QLabel('連線中無法更改 Serial 參數、編碼及歷史容量。\nCOM 埠存取遭拒時，可選擇處理可能占用的程序。')
+        hint = QLabel('連線中無法更改 Serial 參數、編碼及歷史容量。\n若 COM 埠存取遭拒，請先手動關閉占用該埠的程式後重試。')
         hint.setWordWrap(True)
         f.addRow(hint)
+        reconnect = QCheckBox('中斷後自動重連同一個 COM Port')
+        reconnect.setChecked(values.get('serial/reconnect', DEFAULTS['serial/reconnect']))
+        reconnect.setEnabled(not connected)
+        self.controls['serial/reconnect'] = reconnect
+        f.addRow(reconnect)
         f = forms[2]
         directory = QLineEdit(str(values['log/directory']))
         self.controls['log/directory'] = directory
@@ -1566,7 +2089,7 @@ class SettingsDialog(QDialog):
         f.addRow(control)
         spin(f,'log/interval','換檔間隔',.1,999,True)
         combo(f,'log/unit','單位',['分鐘','小時'])
-        hint = QLabel('日誌只在手動開始後寫入，重新啟動或重新連線不會自動記錄。\n只記錄接收文字，移除 ANSI 控制碼。日誌每行時間戳跟隨上方「時間戳記」按鈕，\n不改動終端機收到的字元串流。\n請在登入完成後開始紀錄；遠端回顯的敏感文字仍可能被記錄。')
+        hint = QLabel('日誌由手動開始。啟用 Serial 自動重連時，已開啟的日誌會持續。\n只記錄接收文字並移除 ANSI 控制碼。每行時間戳跟隨上方「時間戳記」按鈕。\n請在登入完成後開始紀錄；遠端回顯的敏感文字仍可能被記錄。')
         hint.setWordWrap(True)
         f.addRow(hint)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel)
@@ -1616,6 +2139,8 @@ class MainWindow(ModernWindow):
         if self.effective_theme not in ('light','dark'):
             self.effective_theme = system_theme()
         self.worker = None
+        self._display_needs_reset = False
+        self._shown_diagnostic_failure = None
         self.auth_dialog = None
         self.closing = False
         self.connected_state = False
@@ -1742,7 +2267,6 @@ class MainWindow(ModernWindow):
         layout.addWidget(self.terminal,1)
         self.terminal.transmit.connect(self.send_data)
         self.terminal.sizeChanged.connect(self.terminal_resized)
-        self.terminal.textReceived.connect(self.log_received)
         footer = QHBoxLayout()
         self.status = QLabel('未連線')
         self.status.setAccessibleName('連線狀態')
@@ -1750,12 +2274,27 @@ class MainWindow(ModernWindow):
         self.status.setWordWrap(True)
         footer.addWidget(self.status,1)
         self.grid_size = QLabel('80 × 24')
+        self.recording_status = QLabel()
+        self.recording_status.setWordWrap(True)
+        self.recording_status.setTextFormat(Qt.TextFormat.PlainText)
+        footer.addWidget(self.recording_status)
+        self.diagnostic_status = QLabel()
+        self.diagnostic_status.setWordWrap(True)
+        self.diagnostic_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.diagnostic_status.hide()
+        footer.addWidget(self.diagnostic_status)
         footer.addWidget(self.grid_size)
         layout.addLayout(footer)
         self.apply_theme()
         self.sync_timestamp_button()
         self.restore_window()
-        QTimer.singleShot(0,self.terminal.setFocus)
+        self._connection_action_timer = single_shot_timer(self, self._finish_connection_action)
+        self._startup_timer = single_shot_timer(self, self._apply_startup_view)
+        self.display_timer = QTimer(self)
+        self.display_timer.timeout.connect(self.drain_display)
+        self.display_timer.start(30)
+        self._startup_timer.start(0)
+        self._refresh_diagnostic_status()
 
     def refresh_ports(self):
         current = self.com.currentText() if hasattr(self,'com') else ''
@@ -1836,7 +2375,7 @@ class MainWindow(ModernWindow):
             return
         self.values['terminal/timestamp'] = bool(enabled)
         if self.logger.handle:
-            self.logger.timestamp = bool(enabled)
+            self.logger.configure(timestamp=bool(enabled))
         self.terminal.set_timestamps(enabled)
         self.sync_timestamp_button()
         self.terminal.setFocus()
@@ -1873,7 +2412,7 @@ class MainWindow(ModernWindow):
         self.terminal.set_appearance()
         self.terminal.set_timestamps(changes['terminal/timestamp'])
         if self.logger.handle:
-            self.logger.timestamp = changes['terminal/timestamp']
+            self.logger.configure(timestamp=changes['terminal/timestamp'])
         self.sync_timestamp_button()
         self.terminal.setFocus()
         if self.logger.handle:
@@ -1881,14 +2420,10 @@ class MainWindow(ModernWindow):
             try:
                 directory = persistent_path(changes['log/directory'])
                 if directory != self.logger.directory:
-                    replacement = SessionLogger()
-                    replacement.start(directory,interval,changes['terminal/timestamp'])
-                    self.logger.stop()
-                    self.logger = replacement
+                    self.logger.start(directory,interval,changes['terminal/timestamp'])
                     self.log_button.setToolTip(str(directory))
                 else:
-                    self.logger.interval = interval
-                    self.logger.timestamp = changes['terminal/timestamp']
+                    self.logger.configure(interval=interval,timestamp=changes['terminal/timestamp'])
             except OSError as exc:
                 QMessageBox.warning(self,'日誌仍使用原設定',str(exc))
 
@@ -1930,13 +2465,15 @@ class MainWindow(ModernWindow):
             QMessageBox.warning(self,'無法連線',str(exc))
             return
         self.terminal.reset_session()
+        self.logger.reset_input(values['terminal/encoding'])
         self.status.setText('連線中…')
         self.connection_fields.setEnabled(False)
         self.connect_button.setText('中斷')
         self.connected_state = False
-        worker = ConnectionWorker(config,(self.terminal.model.screen.columns,self.terminal.model.screen.lines),self)
+        worker = ConnectionWorker(config,(self.terminal.model.screen.columns,self.terminal.model.screen.lines),self,
+                                  logger=self.logger)
         self.worker = worker
-        worker.received.connect(self.receive_data)
+        worker.serial_reconnecting.connect(self.connection_reconnecting)
         worker.connected.connect(self.connection_ready)
         worker.problem.connect(self.connection_problem)
         worker.prompt.connect(self.authentication_prompt)
@@ -1954,8 +2491,62 @@ class MainWindow(ModernWindow):
     def connection_problem(self, message):
         self.status.setText(message)
 
+    def connection_reconnecting(self):
+        self.connected_state = False
+        self.status.setText('Serial 已中斷，正在重連同一個 COM Port…')
+
     def receive_data(self, data):
-        self.terminal.feed(data)
+        self.logger.receive(data)
+        self.render_received(data)
+
+    def render_received(self, data):
+        try:
+            if self._display_needs_reset:
+                self.terminal.reset_session()
+                self._display_needs_reset = False
+            self.terminal.feed(data)
+        except Exception:
+            self._display_needs_reset = True
+            record_exception('TerminalWidget.feed', chunk_bytes=len(data), connected=self.connected_state)
+            self.recording_status.setText('終端解析失敗，接收紀錄獨立處理')
+
+    @guard_ui
+    def drain_display(self, limit=16384):
+        self._refresh_diagnostic_status()
+        worker = self.worker
+        if qt_alive(worker) and qt_alive(self.terminal):
+            data, skipped = worker.take_display(limit)
+            if skipped:
+                diagnostic('display_overrun', bytes_skipped=skipped)
+                self._display_needs_reset = True
+                self.recording_status.setText(f'畫面略過 {worker.display_total_skipped:,} bytes；請查看日誌狀態')
+            if data:
+                self.render_received(data)
+        failure = self.logger.fault or self.logger.rotation_warning
+        if failure:
+            if self.recording_status.text() != failure:
+                self.recording_status.setText(failure)
+            if self.logger.fault:
+                self.log_button.setText('開始紀錄')
+        elif self.recording_status.text() == '換檔失敗，仍寫入上一份日誌':
+            self.recording_status.clear()
+
+    def _refresh_diagnostic_status(self):
+        if DIAGNOSTICS is None or not DIAGNOSTICS.error or not qt_alive(self.diagnostic_status):
+            return
+        with DIAGNOSTICS.lock:
+            last = DIAGNOSTICS.recent_failures[-1] if DIAGNOSTICS.recent_failures else None
+        state = DIAGNOSTICS.error, last
+        if state == self._shown_diagnostic_failure:
+            return
+        self.diagnostic_status.setText(state[0])
+        details = ['Python 例外攔截仍啟用。無法寫入檔案的近期例外保留在記憶體。']
+        if last:
+            details.append(f'{last["callback"]} · {last["type"]}')
+            details.extend(f'{file}:{line} · {function}' for file, line, function in last['frames'])
+        self.diagnostic_status.setToolTip('\n'.join(details))
+        self.diagnostic_status.show()
+        self._shown_diagnostic_failure = state
 
     def send_data(self, data):
         if self.worker is not None and self.connected_state:
@@ -1963,12 +2554,14 @@ class MainWindow(ModernWindow):
 
     def terminal_resized(self, columns, lines):
         self.grid_size.setText(f'{columns} × {lines}')
-        if self.worker:
-            self.worker.resize_terminal(columns,lines)
+        worker = self.worker
+        if qt_alive(worker) and not self.closing:
+            worker.resize_terminal(columns,lines)
 
     def authentication_prompt(self, request):
         future = request['future']
-        if future.done() or self.closing:
+        worker = self.worker
+        if future.done() or self.closing or not qt_alive(worker) or self.sender() is not worker:
             return
         answer = None
         if request['kind']=='hostkey':
@@ -2000,20 +2593,23 @@ class MainWindow(ModernWindow):
                 future.set_result(answer)
             except concurrent.futures.InvalidStateError:
                 pass
-        if answer is None and self.worker:
-            self.worker.stop()
+        if answer is None and self.worker is worker and qt_alive(worker):
+            worker.stop()
 
     def connection_finished(self):
-        if self.auth_dialog:
+        worker = self.worker
+        if self.sender() is not worker or not qt_alive(worker):
+            return
+        if qt_alive(self.auth_dialog):
             self.auth_dialog.reject()
-        worker,self.worker = self.worker,None
         self.connected_state = False
-        if worker:
-            worker.deleteLater()
-        tail = self.terminal.model.finish()
-        if tail:
-            self.log_received(tail)
-        self.logger.stop()
+        self.drain_display(limit=1024*1024)
+        self.worker = None
+        worker.deleteLater()
+        try:
+            self.terminal.model.finish()
+        except Exception:
+            record_exception('TerminalModel.finish')
         self.log_button.setText('開始紀錄')
         self.connect_button.setText('連線')
         self.connect_button.setEnabled(True)
@@ -2021,7 +2617,12 @@ class MainWindow(ModernWindow):
         if self.status.text().startswith(('已連線','連線中','正在中斷')):
             self.status.setText('連線已中斷')
         if self.closing:
-            QTimer.singleShot(0,self.close)
+            self._connection_action_timer.start(0)
+
+    @guard_ui
+    def _finish_connection_action(self):
+        if self.closing:
+            self.close()
 
     def toggle_logging(self):
         if self.logger.handle:
@@ -2034,6 +2635,7 @@ class MainWindow(ModernWindow):
             interval = values['log/interval']*(60 if values['log/unit']=='分鐘' else 3600) if values['log/rotate'] else 0
             self.preferences.save(values)
             self.logger.start(values['log/directory'],interval,values['terminal/timestamp'])
+            self.recording_status.clear()
             self.log_button.setText('停止紀錄')
             self.log_button.setToolTip(str(self.logger.directory))
         except (ValueError,OSError) as exc:
@@ -2041,32 +2643,37 @@ class MainWindow(ModernWindow):
             QMessageBox.warning(self,'無法開始紀錄',str(exc))
 
     def log_received(self, text):
-        try:
-            self.logger.write(text)
-        except OSError as exc:
-            self.logger.stop()
-            self.log_button.setText('開始紀錄')
-            QMessageBox.warning(self,'日誌寫入失敗',str(exc))
+        self.logger.write(text)
 
     def restore_window(self):
         geometry = self.preferences.get('window/geometry')
         if geometry is not None:
             self.restoreGeometry(geometry)
         screens = QApplication.screens()
-        if not any(screen.availableGeometry().intersects(self.frameGeometry()) for screen in screens):
-            area = QApplication.primaryScreen().availableGeometry()
-            self.move(area.topLeft()+QPoint(30,30))
-        area = self.screen().availableGeometry()
-        if self.width()>area.width() or self.height()>area.height():
-            self.resize(min(self.width(),area.width()),min(self.height(),area.height()))
-        if self.preferences.get('window/maximized',False):
-            QTimer.singleShot(0,self.showMaximized)
+        if not any(qt_alive(screen) and screen.availableGeometry().intersects(self.frameGeometry()) for screen in screens):
+            primary = QApplication.primaryScreen()
+            if qt_alive(primary):
+                self.move(primary.availableGeometry().topLeft()+QPoint(30,30))
+        screen = self.screen()
+        if qt_alive(screen):
+            area = screen.availableGeometry()
+            if self.width()>area.width() or self.height()>area.height():
+                self.resize(min(self.width(),area.width()),min(self.height(),area.height()))
+
+    @guard_ui
+    def _apply_startup_view(self):
+        if self.closing:
+            return
+        if self.preferences.get('window/maximized', False):
+            self.showMaximized()
+        if qt_alive(self.terminal):
+            self.terminal.setFocus()
 
     def closeEvent(self, event):
+        self.closing = True
         if self.worker is not None:
-            self.closing = True
             self.worker.stop()
-            if self.auth_dialog:
+            if qt_alive(self.auth_dialog):
                 self.auth_dialog.reject()
             event.ignore()
             return
@@ -2080,22 +2687,47 @@ class MainWindow(ModernWindow):
             QMessageBox.warning(self,'無法儲存設定',str(exc))
             event.ignore()
             return
+        for timer in (self._startup_timer, self._maximize_timer, self._connection_action_timer, self.display_timer):
+            timer.stop()
         event.accept()
 
 
 def main():
+    global DIAGNOSTICS
+    DIAGNOSTICS = Diagnostics()
     if sys.platform=='win32':
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('PuddingTerminal.SourceCandidate')
         except (AttributeError,OSError):
             pass
+    DIAGNOSTICS.open_files()
     app = QApplication(sys.argv)
     app.setApplicationName('Pudding Terminal')
-    app.setStyle('Fusion')
+    app.setStyle(ContrastStyle('Fusion'))
     app.setFont(QFont('Segoe UI',10))
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    monitor_stop = threading.Event()
+    monitor = None
+    try:
+        window = MainWindow()
+        monitor = threading.Thread(target=maintain_session, args=(window.logger,monitor_stop),
+                                   name='Session maintenance', daemon=True)
+        monitor.start()
+        window.show()
+        result = app.exec()
+        diagnostic('normal_exit', status=result)
+        return result
+    except Exception:
+        record_exception('main')
+        detail = DIAGNOSTICS.error or '啟動或執行失敗，請查看 diagnostics 資料夾。'
+        QMessageBox.critical(None, 'Pudding Terminal', detail)
+        return 1
+    finally:
+        monitor_stop.set()
+        if monitor is not None:
+            monitor.join()
+        if DIAGNOSTICS:
+            DIAGNOSTICS.close()
+            DIAGNOSTICS = None
 
 if __name__=='__main__':
     sys.exit(main())

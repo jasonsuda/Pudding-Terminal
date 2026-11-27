@@ -1,6 +1,7 @@
 # Local runtime state
 /config/
 /device_logs/
+/diagnostics/
 *.ini
 *.log
 *.pcap
